@@ -101,7 +101,7 @@ class AirVLNSimulatorClientTool:
         self.airsim_clients = [[None for _ in list(item['open_scenes'])] for item in self.machines_info]
         return
 
-    def run_call(self, airsim_timeout: int=60) -> None:
+    def run_call(self, airsim_timeout: int=5) -> None: # 60->5
         socket_clients = []
         for index, item in enumerate(self.machines_info):
             socket_clients.append(
@@ -170,7 +170,7 @@ class AirVLNSimulatorClientTool:
         self._confirmConnection()
         self._closeSocketConnection()
 
-    def getImageResponses(self, get_rgb=True, get_depth=True):
+    def getImageResponses(self, get_rgb=True, get_depth=False): # 不需要深度
 
         def _getImages(airsim_client: airsim.VehicleClient, scen_id, get_rgb, get_depth):
             if airsim_client is None:
@@ -239,13 +239,13 @@ class AirVLNSimulatorClientTool:
                             img_depth = np.array(obs_depth_img, dtype=np.float32)
 
                         break
-                    except:
+                    except Exception as e:
                         time_sleep_cnt += 1
-                        logger.error("Image retrieval error")
+                        logger.error(f"Image retrieval error: {type(e).__name__}: {e}")
                         logger.error('time_sleep_cnt: {}'.format(time_sleep_cnt))
                         time.sleep(1)
 
-                    if time_sleep_cnt > 20:
+                    if time_sleep_cnt > 5:
                         raise Exception('Failed to retrieve image')
 
             else:
@@ -295,13 +295,13 @@ class AirVLNSimulatorClientTool:
                             img_depth = np.array(obs_depth_img, dtype=np.float32)
 
                         break
-                    except:
+                    except Exception as e:
                         time_sleep_cnt += 1
-                        logger.error("Failed to retrieve image")
+                        logger.error(f"Failed to retrieve image: {type(e).__name__}: {e}")
                         logger.error('time_sleep_cnt: {}'.format(time_sleep_cnt))
                         time.sleep(1)
 
-                    if time_sleep_cnt > 20:
+                    if time_sleep_cnt > 5:
                         raise Exception('Failed to retrieve image')
 
             # Tip: If you are using AirVLN code for the first time, please confirm that the

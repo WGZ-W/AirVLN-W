@@ -14,8 +14,8 @@ python -u ./src/vlnce_src/train.py \
 --dagger_it 1 \
 --epochs 500 \
 --lr 0.00025 \
---trainer_gpu_device 0
-
+--trainer_gpu_device 0 \
+--use_llama_tokenizer
 
 
 nohup python -u ./airsim_plugin/AirVLNSimulatorServerTool.py --gpus 0,1,2,3,4,5,6,7 &

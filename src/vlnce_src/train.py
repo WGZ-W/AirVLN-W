@@ -19,6 +19,7 @@ from tensorboardX import SummaryWriter
 
 from typing import List, Optional, DefaultDict
 import msgpack_numpy
+import pickle
 
 from utils.logger import logger
 from utils.utils import get_rank, is_dist_avail_and_initialized, is_main_process, init_distributed_mode
@@ -31,6 +32,8 @@ from Model.utils.common import observations_to_image, append_text_to_image, gene
 from src.common.param import args
 from src.vlnce_src.env import AirVLNENV
 from src.vlnce_src.util import read_vocab, Tokenizer
+
+from transformers import AutoTokenizer
 
 
 def setup():
@@ -117,9 +120,16 @@ class DDPIWTrajectoryDataset(torch.utils.data.IterableDataset):
                         logger.warning("rank: {} \t lmdb load: {} / {}".format(self.rank, i+1, self.preload_size))
 
                     new_preload.append(
-                        msgpack_numpy.unpackb(
-                            txn.get(str(self.keys[self.load_ordering.pop()]).encode()),
-                            raw=False,
+                        # msgpack_numpy.unpackb(
+                        #     txn.get(str(self.keys[self.load_ordering.pop()]).encode()),
+                        #     raw=False,
+                        # )
+                        pickle.loads(
+                            txn.get(
+                                str(
+                                    self.keys[self.load_ordering.pop()]
+                                ).encode()
+                            )
                         )
                     )
 
@@ -180,6 +190,9 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
         inflection_weight_coef=1.0,
         lmdb_map_size=5.0e12,
         batch_size=1,
+        use_llama_tokenizer=False,          # 新增
+        llama_model_name="meta-llama/Llama-2-7b-hf",  # 新增，可选其他模型
+        max_input_len=300,                  # 新增，指令最大长度
     ):
         super().__init__()
 
@@ -216,6 +229,19 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
         self.iter_end = self.length
         logger.warning("END init Dataset \t start({}) - end({})".format(self.iter_start, self.iter_end))
 
+        self.use_llama_tokenizer = use_llama_tokenizer
+        self.max_input_len = max_input_len
+        if use_llama_tokenizer:
+            self.tokenizer = AutoTokenizer.from_pretrained(llama_model_name)
+            # LLaMA tokenizer 默认没有 pad_token，设置为 eos_token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            # 确保 padding 在右侧（因果 LM 需要）
+            self.tokenizer.padding_side = "right"
+        else:
+            self.tokenizer = None
+
+
     def _load_next(self):
         if len(self._preload) == 0:
             if len(self.load_ordering) == 0:
@@ -240,9 +266,16 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
                             logger.info("{} lmdb load: {} / {}".format(0, i+1, self.preload_size))
 
                     new_preload.append(
-                        msgpack_numpy.unpackb(
-                            txn.get(str(self.keys[self.load_ordering.pop()]).encode()),
-                            raw=False,
+                        # msgpack_numpy.unpackb(
+                        #     txn.get(str(self.keys[self.load_ordering.pop()]).encode()),
+                        #     raw=False,
+                        # )
+                        pickle.loads(
+                            txn.get(
+                                str(
+                                    self.keys[self.load_ordering.pop()]
+                                ).encode()
+                            )
                         )
                     )
 
@@ -261,10 +294,37 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
 
         return self._preload.pop()
 
+
     def __next__(self):
         obs, prev_actions, oracle_actions = self._load_next()
 
+        # 如果使用 LLaMA tokenizer，则在线编码 instruction_text
+        if self.use_llama_tokenizer:
+            # obs 中应该包含 'instruction_text' 字段（字符串）
+            text = obs.get('instruction_text')
+            if text is None:
+                raise KeyError("instruction_text not found in obs, but use_llama_tokenizer=True")
+            # tokenize 指令文本
+            tokens = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=self.max_input_len,
+                padding='max_length',
+                return_tensors='pt'
+            )['input_ids'][0]          # shape: (max_input_len,)
+            # 将 tokens 转换为 numpy 数组（保持与原有格式一致）
+            obs['instruction'] = tokens.numpy()
+            # 删除原始文本，避免后续误用
+            del obs['instruction_text']
+            # 注意：此时 obs 中还有 'rgb_features' 等其他字段，它们仍是 numpy 数组（尚未转换）
+        else:
+            # 原有逻辑：直接使用预存的 token IDs（假设已存在 'instruction' 字段）
+            pass
+
         for k, v in obs.items():
+            if isinstance(v, str):
+                # 保留字符串，不转换
+                continue
             obs[k] = torch.from_numpy(np.copy(v))
 
         prev_actions = torch.from_numpy(np.copy(prev_actions))
@@ -438,6 +498,17 @@ def initialize_tokenizer():
         vocab = read_vocab(args.TRAIN_VOCAB)
         tok = Tokenizer(vocab=vocab, encoding_length=args.maxInput)
 
+    # llm_path = "/mnt/sdc/weiguanzhao/navila-llama3-8b-8f/llm"
+    
+    # tok = AutoTokenizer.from_pretrained(
+    #         llm_path,
+    #         model_max_length=args.maxInput,
+    #         padding_side="right",
+    #         use_fast=False,
+    #         legacy=False,
+    # )
+    # tok.pad_token = tok.eos_token
+
     return tok
 
 
@@ -475,7 +546,8 @@ def initialize_trainer():
 def collect_data(data_it=0):
     logger.info(args)
 
-    train_env = initialize_env(split='train')
+    # train_env = initialize_env(split='train')
+    train_env = initialize_env(split='scene_3')
     trainer = initialize_trainer()
 
     if torch.cuda.is_available():
@@ -488,6 +560,8 @@ def collect_data(data_it=0):
 
         return hook
 
+    # 注册前向钩子，用于捕获 rgb_encoder 和 depth_encoder 输出的中间特征（而非原始图像）。
+    # 这些特征会被保存到轨迹中，避免后续训练时重新编码图像。
     rgb_features = torch.zeros((1,), device="cpu")
     if not args.ablate_rgb:
         rgb_hook = trainer.policy.net.rgb_encoder.layer_extract.register_forward_hook(
@@ -511,6 +585,7 @@ def collect_data(data_it=0):
     #
     with torch.no_grad():
         end_iter = len(train_env.data)
+        # end_iter = 8
         pbar = None
         pbar_pre_index = 0
         while train_env.index_data < end_iter:
@@ -562,6 +637,7 @@ def collect_data(data_it=0):
 
             ended = False
 
+            # 每一步策略执行与数据记录
             for t in range(int(args.maxAction) + 1):
                 logger.info('{} - {} / {}'.format(int(train_env.index_data)-int(train_env.batch_size), t, end_iter))
 
@@ -581,6 +657,10 @@ def collect_data(data_it=0):
                                 del traj_obs['teacher_action']
                                 for k, v in traj_obs.items():
                                     traj_obs[k] = v.numpy()
+                                
+                                # 添加原始指令文本
+                                instruction_text = train_env.batch[i]['instruction']['instruction_text']
+                                traj_obs['instruction_text'] = instruction_text   # 字符串
 
                                 transposed_ep = [
                                     traj_obs,
@@ -592,8 +672,12 @@ def collect_data(data_it=0):
                                 lmdb_key = str(train_env.trajectory_id_2_episode_ids[infos[i]['trajectory_id']][_i])
                                 train_env.lmdb_features_txn.put(
                                     lmdb_key.encode(),
-                                    msgpack_numpy.packb(
-                                        transposed_ep, use_bin_type=True
+                                    # msgpack_numpy.packb(
+                                    #     transposed_ep, use_bin_type=True
+                                    # ),
+                                    pickle.dumps(
+                                        transposed_ep,
+                                        protocol=pickle.HIGHEST_PROTOCOL
                                     ),
                                 )
                                 train_env.lmdb_features_txn.commit()
@@ -630,6 +714,10 @@ def collect_data(data_it=0):
                             for k, v in traj_obs.items():
                                 traj_obs[k] = v.numpy()
 
+                            # 添加原始指令文本
+                            instruction_text = train_env.batch[i]['instruction']['instruction_text']
+                            traj_obs['instruction_text'] = instruction_text   # 字符串
+
                             transposed_ep = [
                                 traj_obs,
                                 np.array([step[1] for step in ep], dtype=np.int64),
@@ -640,8 +728,12 @@ def collect_data(data_it=0):
                             lmdb_key = str(infos[i]['episode_id'])
                             train_env.lmdb_features_txn.put(
                                 lmdb_key.encode(),
-                                msgpack_numpy.packb(
-                                    transposed_ep, use_bin_type=True
+                                # msgpack_numpy.packb(
+                                #     transposed_ep, use_bin_type=True
+                                # ),
+                                pickle.dumps(
+                                    transposed_ep,
+                                    protocol=pickle.HIGHEST_PROTOCOL
                                 ),
                             )
                             train_env.lmdb_features_txn.commit()
@@ -690,7 +782,11 @@ def collect_data(data_it=0):
                 for i in range(train_env.batch_size):
                     if not args.ablate_rgb and rgb_features is not None:
                         observations[i]["rgb_features"] = rgb_features[i]
-                        del observations[i]["rgb"]
+                        # del observations[i]["rgb"]
+                        
+                        # 确保 rgb 是 numpy 数组（如果不是则转换）
+                        if not isinstance(observations[i]["rgb"], np.ndarray):
+                            observations[i]["rgb"] = np.array(observations[i]["rgb"])
 
                     if not args.ablate_depth and depth_features is not None:
                         observations[i]["depth_features"] = depth_features[i]
@@ -746,6 +842,11 @@ def collect_data(data_it=0):
                         for k, v in traj_obs.items():
                             traj_obs[k] = v.numpy()
 
+                        # 添加原始指令文本
+                        instruction_text = train_env.batch[i]['instruction']['instruction_text']
+                        traj_obs['instruction_text'] = instruction_text   # 字符串
+
+
                         transposed_ep = [
                             traj_obs,
                             np.array([step[1] for step in ep], dtype=np.int64),
@@ -756,8 +857,12 @@ def collect_data(data_it=0):
                         lmdb_key = str(train_env.trajectory_id_2_episode_ids[infos[i]['trajectory_id']][_i])
                         train_env.lmdb_features_txn.put(
                             lmdb_key.encode(),
-                            msgpack_numpy.packb(
-                                transposed_ep, use_bin_type=True
+                            # msgpack_numpy.packb(
+                            #     transposed_ep, use_bin_type=True
+                            # ),
+                            pickle.dumps(
+                                transposed_ep,
+                                protocol=pickle.HIGHEST_PROTOCOL
                             ),
                         )
                         train_env.lmdb_features_txn.commit()
@@ -796,6 +901,10 @@ def collect_data(data_it=0):
                     del traj_obs['teacher_action']
                     for k, v in traj_obs.items():
                         traj_obs[k] = v.numpy()
+                    
+                    # 添加原始指令文本
+                    instruction_text = train_env.batch[i]['instruction']['instruction_text']
+                    traj_obs['instruction_text'] = instruction_text   # 字符串
 
                     transposed_ep = [
                         traj_obs,
@@ -807,8 +916,12 @@ def collect_data(data_it=0):
                     lmdb_key = str(infos[i]['episode_id'])
                     train_env.lmdb_features_txn.put(
                         lmdb_key.encode(),
-                        msgpack_numpy.packb(
-                            transposed_ep, use_bin_type=True
+                        # msgpack_numpy.packb(
+                        #     transposed_ep, use_bin_type=True
+                        # ),
+                        pickle.dumps(
+                            transposed_ep,
+                            protocol=pickle.HIGHEST_PROTOCOL
                         ),
                     )
                     train_env.lmdb_features_txn.commit()
@@ -874,6 +987,7 @@ def train_vlnce():
 
         lmdb_features_dir = str(Path(args.project_prefix) / 'DATA/img_features/collect/{}/train'.format(args.name))
         assert os.path.exists(str(lmdb_features_dir))
+        use_llama = getattr(args, 'use_llama_tokenizer', False)
         if args.DistributedDataParallel:
             dataset = DDPIWTrajectoryDataset(
                 lmdb_features_dir,
@@ -898,6 +1012,8 @@ def train_vlnce():
                 inflection_weight_coef=float(args.inflection_weight_coef),
                 lmdb_map_size=5.0e12,
                 batch_size=args.batchSize,
+                use_llama_tokenizer=use_llama,
+                max_input_len=args.maxInput,
             )
             diter = torch.utils.data.DataLoader(
                 dataset,

@@ -17,6 +17,13 @@ class Param:
         self.parser.add_argument('--collect_type', type=str, default="TF", help="seq2seq in [TF, dagger, SF]")
         self.parser.add_argument('--name', type=str, default='default', help='experiment name')
 
+        # 在 parser 定义之后添加
+        self.parser.add_argument('--use_llama_tokenizer', action='store_true', 
+                            help='Use LLaMA tokenizer instead of BERT/custom tokenizer')
+        self.parser.add_argument('--llama_model_name', type=str, 
+                                 default="/mnt/sdc/weiguanzhao/navila-llama3-8b-8f/llm",
+                            help='Pretrained LLaMA model name for tokenizer')
+
         self.parser.add_argument('--maxInput', type=int, default=300, help="max input instruction")
         self.parser.add_argument('--maxAction', type=int, default=500, help='max action sequence')
 
@@ -91,6 +98,7 @@ args.machines_info = [
         'MACHINE_IP': '127.0.0.1',
         'SOCKET_PORT': int(args.simulator_tool_port),
         'MAX_SCENE_NUM': 16,
+        # 'MAX_SCENE_NUM': 8,
         'open_scenes': [],
     },
 ]

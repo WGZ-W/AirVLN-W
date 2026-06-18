@@ -3,6 +3,7 @@ import random
 import time
 
 import msgpack_numpy
+import pickle   # 确保文件头部已导入
 import numpy as np
 import math
 from gym import spaces
@@ -96,7 +97,7 @@ class AirVLNENV:
                     max_length=args.maxInput,
                     padding='max_length',
                     return_tensors="pt"
-                )['input_ids'][0]
+                )['input_ids'][0]   # 1D tensor
             else:
                 instruction_tokens = tokenizer.encode_sentence(item['instruction']['instruction_text'])
             new_item['instruction']['instruction_tokens'] = instruction_tokens
@@ -538,21 +539,22 @@ class AirVLNENV:
                         self.threading_lock_lmdb_rgb_txn.acquire()
                         self.lmdb_rgb_txn.put(
                             lmdb_rgb_key.encode(),
-                            msgpack_numpy.packb(
-                                rgb_image, use_bin_type=True
-                            ),
+                            pickle.dumps(rgb_image, protocol=pickle.HIGHEST_PROTOCOL),
+                            # msgpack_numpy.packb(
+                            #     rgb_image, use_bin_type=True
+                            # ),
                         )
                         self.threading_lock_lmdb_rgb_txn.release()
 
-                    if depth_image is not None:
-                        self.threading_lock_lmdb_depth_txn.acquire()
-                        self.lmdb_depth_txn.put(
-                            lmdb_depth_key.encode(),
-                            msgpack_numpy.packb(
-                                depth_image, use_bin_type=True
-                            ),
-                        )
-                        self.threading_lock_lmdb_depth_txn.release()
+                    # if depth_image is not None:
+                    #     self.threading_lock_lmdb_depth_txn.acquire()
+                    #     self.lmdb_depth_txn.put(
+                    #         lmdb_depth_key.encode(),
+                    #         msgpack_numpy.packb(
+                    #             depth_image, use_bin_type=True
+                    #         ),
+                    #     )
+                    #     self.threading_lock_lmdb_depth_txn.release()
 
         return states
 

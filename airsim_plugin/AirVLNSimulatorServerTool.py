@@ -429,6 +429,8 @@ class EventHandler(object):
 
         self.scene_used_ports += copy.deepcopy(ports)
 
+        print(f"Allocated ports: {ports}")
+
         return True, (ip, ports)
 
     def reopen_scenes(self, ip: str, scen_ids: list):
