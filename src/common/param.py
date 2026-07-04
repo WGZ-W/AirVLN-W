@@ -29,7 +29,8 @@ class Param:
 
         self.parser.add_argument("--dagger_it", type=int, default=1)
         self.parser.add_argument("--epochs", type=int, default=10)
-        self.parser.add_argument('--lr', type=float, default=0.00025, help="learning rate")
+        # self.parser.add_argument('--lr', type=float, default=0.00025, help="learning rate")
+        self.parser.add_argument('--lr', type=float, default=5e-6, help="learning rate")
         self.parser.add_argument('--batchSize', type=int, default=8)
         self.parser.add_argument("--trainer_gpu_device", type=int, default=0, help='GPU')
 

@@ -1,5 +1,10 @@
 import os
 import sys
+import deepspeed
+
+# 将 AirVLN-W 目录添加到 Python 搜索路径
+sys.path.insert(0, "/mnt/sdd/weiguanzhao/AirVLN_ws/AirVLN-W")
+print("sys.path =", sys.path)
 from pathlib import Path
 sys.path.append(str(Path(str(os.getcwd())).resolve()))
 import gc
@@ -56,8 +61,15 @@ class DDPIWTrajectoryDataset(torch.utils.data.IterableDataset):
         inflection_weight_coef=1.0,
         lmdb_map_size=5.0e12,
         batch_size=1,
+        max_input_len=300,                  # 新增，指令最大长度
+        tokenizer=None,            # 新增
+        image_processor=None,      # 新增
     ):
         super().__init__()
+
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.max_input_len = max_input_len
 
         self.lmdb_features_dir = lmdb_features_dir
         self.lmdb_map_size = lmdb_map_size
@@ -150,9 +162,47 @@ class DDPIWTrajectoryDataset(torch.utils.data.IterableDataset):
 
     def __next__(self):
         obs, prev_actions, oracle_actions = self._load_next()
+        T = obs['rgb'].shape[0]  # 假设图像是 (T, H, W, 3)
+
+        # 1. 文本 tokenization（如果需要）
+        if self.tokenizer is not None:
+            text = obs.get('instruction_text')
+            if text is None:
+                raise KeyError("instruction_text not found")
+            tokens = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=self.max_input_len,
+                padding='max_length',
+                return_tensors='np'
+            )['input_ids']                     # (1, max_len)
+            obs['input_ids'] = np.repeat(tokens, T, axis=0)  # (T, max_len)
+            # 可选：删除 instruction_text 以节省内存
+            del obs['instruction_text']
+
+
+        # 2. 图像预处理（如果使用 LLaVA）
+        if self.image_processor is not None:
+            rgb_images = obs['rgb']            # (T, H, W, 3), uint8
+            pixel_values = self.image_processor(
+                images=[rgb_images[i] for i in range(T)],
+                return_tensors="np"
+            )['pixel_values']                  # (T, 3, 224, 224)
+            obs['pixel_values'] = pixel_values
+            # 可保留 rgb 用于可视化，或删除以节省内存
+            del obs['rgb']
+        else:
+            print("Image_processor is None")
 
         for k, v in obs.items():
+            if isinstance(v, str):
+                # 保留字符串，不转换
+                continue
             obs[k] = torch.from_numpy(np.copy(v))
+
+
+        # for k, v in obs.items():
+        #     obs[k] = torch.from_numpy(np.copy(v))
 
         prev_actions = torch.from_numpy(np.copy(prev_actions))
         oracle_actions = torch.from_numpy(np.copy(oracle_actions))
@@ -191,8 +241,11 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
         lmdb_map_size=5.0e12,
         batch_size=1,
         use_llama_tokenizer=False,          # 新增
-        llama_model_name="meta-llama/Llama-2-7b-hf",  # 新增，可选其他模型
+        llama_model_name="/mnt/sdc/weiguanzhao/navila-llama3-8b-8f/llm",  # 新增，可选其他模型
         max_input_len=300,                  # 新增，指令最大长度
+        use_llava=False,
+        tokenizer=None,            # 新增
+        image_processor=None,      # 新增
     ):
         super().__init__()
 
@@ -231,15 +284,19 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
 
         self.use_llama_tokenizer = use_llama_tokenizer
         self.max_input_len = max_input_len
-        if use_llama_tokenizer:
-            self.tokenizer = AutoTokenizer.from_pretrained(llama_model_name)
-            # LLaMA tokenizer 默认没有 pad_token，设置为 eos_token
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            # 确保 padding 在右侧（因果 LM 需要）
-            self.tokenizer.padding_side = "right"
-        else:
-            self.tokenizer = None
+        # if use_llama_tokenizer:
+        #     self.tokenizer = AutoTokenizer.from_pretrained(llama_model_name)
+        #     # LLaMA tokenizer 默认没有 pad_token，设置为 eos_token
+        #     if self.tokenizer.pad_token is None:
+        #         self.tokenizer.pad_token = self.tokenizer.eos_token
+        #     # 确保 padding 在右侧（因果 LM 需要）
+        #     self.tokenizer.padding_side = "right"
+        # else:
+        #     self.tokenizer = None
+        
+        self.use_llava = use_llava
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
 
 
     def _load_next(self):
@@ -297,32 +354,68 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
 
     def __next__(self):
         obs, prev_actions, oracle_actions = self._load_next()
+        T = obs['rgb'].shape[0]  # 假设图像是 (T, H, W, 3)
 
-        # 如果使用 LLaMA tokenizer，则在线编码 instruction_text
-        if self.use_llama_tokenizer:
-            # obs 中应该包含 'instruction_text' 字段（字符串）
+        # 1. 文本 tokenization（如果需要）
+        if self.tokenizer is not None:
             text = obs.get('instruction_text')
             if text is None:
-                raise KeyError("instruction_text not found in obs, but use_llama_tokenizer=True")
-            # tokenize 指令文本
+                raise KeyError("instruction_text not found")
             tokens = self.tokenizer(
                 text,
                 truncation=True,
                 max_length=self.max_input_len,
                 padding='max_length',
-                return_tensors='pt'
-            )['input_ids'][0]          # shape: (max_input_len,)
-            # 将 tokens 转换为 numpy 数组（保持与原有格式一致）
-            obs['instruction'] = tokens.numpy()
-            # 删除原始文本，避免后续误用
+                return_tensors='np'
+            )['input_ids']                     # (1, max_len)
+            obs['input_ids'] = np.repeat(tokens, T, axis=0)  # (T, max_len)
+            # 可选：删除 instruction_text 以节省内存
             del obs['instruction_text']
-            # 注意：此时 obs 中还有 'rgb_features' 等其他字段，它们仍是 numpy 数组（尚未转换）
-        else:
-            # 原有逻辑：直接使用预存的 token IDs（假设已存在 'instruction' 字段）
-            pass
+        
+
+        # 如果使用 LLaMA tokenizer，则在线编码 instruction_text
+        # if self.use_llama_tokenizer:
+        #     # obs 中应该包含 'instruction_text' 字段（字符串）
+        #     text = obs.get('instruction_text')
+        #     if text is None:
+        #         raise KeyError("instruction_text not found in obs, but use_llama_tokenizer=True")
+        #     # tokenize 指令文本
+        #     tokens = self.tokenizer(
+        #         text,
+        #         truncation=True,
+        #         max_length=self.max_input_len,
+        #         padding='max_length',
+        #         return_tensors='pt'
+        #     )['input_ids'][0]          # shape: (max_input_len,)
+        #     # 将 tokens 转换为 numpy 数组（保持与原有格式一致）
+        #     obs['instruction'] = tokens.numpy()
+        #     # 删除原始文本，避免后续误用
+        #     del obs['instruction_text']
+        #     # 注意：此时 obs 中还有 'rgb_features' 等其他字段，它们仍是 numpy 数组（尚未转换）
+        # else:
+        #     # 原有逻辑：直接使用预存的 token IDs（假设已存在 'instruction' 字段）
+        #     pass
+
+
+        # 2. 图像预处理（如果使用 LLaVA）
+        if self.image_processor is not None:
+            rgb_images = obs['rgb']            # (T, H, W, 3), uint8
+            pixel_values = self.image_processor(
+                images=[rgb_images[i] for i in range(T)],
+                return_tensors="np"
+            )['pixel_values']                  # (T, 3, 224, 224)
+            obs['pixel_values'] = pixel_values
+            # assert not np.isnan(obs['pixel_values']).any(), "pixel_values has NaN"
+            # 可保留 rgb 用于可视化，或删除以节省内存
+            del obs['rgb']
+
+        # 3. 清理所有字符串字段（防御性）
+        str_keys = [k for k, v in obs.items() if isinstance(v, (str, np.str_))]
+        for k in str_keys:
+            del obs[k]
 
         for k, v in obs.items():
-            if isinstance(v, str):
+            if isinstance(v, (str, np.str_)):
                 # 保留字符串，不转换
                 continue
             obs[k] = torch.from_numpy(np.copy(v))
@@ -373,6 +466,64 @@ class ObservationsDict(dict):
 
         return self
 
+# def collate_fn(batch):
+#     """Each sample in batch: (
+#         obs,
+#         prev_actions,
+#         oracle_actions,
+#         inflec_weight,
+#     )
+#     """
+#     FIXED_LEN = 500  # 固定填充长度，可根据需要改为 args.maxAction 等
+
+#     transposed = list(zip(*batch))
+#     obs_list = transposed[0]          # list of dict
+#     prev_actions_list = transposed[1] # list of Tensor, shape (T_i,)
+#     oracle_actions_list = transposed[2]
+#     weights_list = transposed[3]
+
+#     def pad_obs(obs, max_len):
+#         new_obs = {}
+#         for k, v in obs.items():
+#             if isinstance(v, torch.Tensor):
+#                 # 1. 截断过长轨迹
+#                 if v.shape[0] > max_len:
+#                     v = v[:max_len]
+#                 # 2. 填充到 max_len
+#                 pad_val = 0 if k in ['pixel_values', 'input_ids'] else 1
+#                 pad_size = max_len - v.shape[0]
+#                 if pad_size > 0:
+#                     pad = torch.full((pad_size, *v.shape[1:]), pad_val, dtype=v.dtype)
+#                     v = torch.cat([v, pad], dim=0)
+#                 new_obs[k] = v
+#             else:
+#                 new_obs[k] = v
+#         return new_obs
+
+#     # 对每个轨迹填充/截断
+#     obs_list = [pad_obs(obs, FIXED_LEN) for obs in obs_list]
+
+#     # 对动作和权重同样处理
+#     def pad_sequence(tensor_list, max_len, fill_val):
+#         new_list = []
+#         for t in tensor_list:
+#             if t.shape[0] > max_len:
+#                 t = t[:max_len]
+#             if t.shape[0] < max_len:
+#                 pad = torch.full((max_len - t.shape[0],), fill_val, dtype=t.dtype)
+#                 t = torch.cat([t, pad], dim=0)
+#             new_list.append(t)
+#         return new_list
+
+#     prev_actions_list = pad_sequence(prev_actions_list, FIXED_LEN, 0)
+#     oracle_actions_list = pad_sequence(oracle_actions_list, FIXED_LEN, 0)
+#     weights_list = pad_sequence(weights_list, FIXED_LEN, 0.0)  # 填充权重为 0
+
+#     return obs_list, prev_actions_list, oracle_actions_list, weights_list
+
+
+
+
 
 def collate_fn(batch):
     """Each sample in batch: (
@@ -394,63 +545,110 @@ def collate_fn(batch):
         return torch.cat([t, pad], dim=0)
 
     transposed = list(zip(*batch))
+    obs_list = transposed[0]          # list of dict, 每个dict对应一个轨迹
+    prev_actions_list = transposed[1] # list of Tensor, 每个形状 (T_i,)
+    oracle_actions_list = transposed[2]
+    weights_list = transposed[3]
 
-    observations_batch = list(transposed[0])
-    prev_actions_batch = list(transposed[1])
-    corrected_actions_batch = list(transposed[2])
-    weights_batch = list(transposed[3])
-    B = len(prev_actions_batch)
+    # 计算 batch 内最大轨迹长度
+    max_len = max([obs['pixel_values'].shape[0] for obs in obs_list])
 
-    new_observations_batch = defaultdict(list)
-    for sensor in observations_batch[0]:
-        for bid in range(B):
-            new_observations_batch[sensor].append(
-                observations_batch[bid][sensor]
-            )
+    # 填充函数
+    def pad_obs(obs, max_len):
+        new_obs = {}
+        for k, v in obs.items():
+            if isinstance(v, torch.Tensor):
+                # 根据传感器类型选择填充值（图像/特征用0，指令用0）
+                pad_val = 0 if k in ['pixel_values', 'input_ids'] else 1
+                # 填充到 max_len
+                pad_size = max_len - v.shape[0]
+                if pad_size > 0:
+                    pad = torch.full((pad_size, *v.shape[1:]), pad_val, dtype=v.dtype)
+                    v = torch.cat([v, pad], dim=0)
+                new_obs[k] = v
+            else:
+                new_obs[k] = v
+        return new_obs
 
-    observations_batch = new_observations_batch
+    # 对每个轨迹填充
+    obs_list = [pad_obs(obs, max_len) for obs in obs_list]
+    prev_actions_list = [
+        torch.cat([act, torch.full((max_len - act.shape[0],), 0, dtype=act.dtype)]) 
+        if act.shape[0] < max_len else act for act in prev_actions_list
+    ]
+    oracle_actions_list = [
+        torch.cat([act, torch.full((max_len - act.shape[0],), 0, dtype=act.dtype)]) 
+        if act.shape[0] < max_len else act for act in oracle_actions_list
+    ]
+    weights_list = [
+        torch.cat([w, torch.full((max_len - w.shape[0],), 0.0, dtype=w.dtype)]) 
+        if w.shape[0] < max_len else w for w in weights_list
+    ]
 
-    # max_traj_len = max(ele.size(0) for ele in prev_actions_batch)
-    max_traj_len = 500
-    for bid in range(B):
-        for sensor in observations_batch:
-            observations_batch[sensor][bid] = _pad_helper(
-                observations_batch[sensor][bid][:max_traj_len, ...], max_traj_len, fill_val=1.0
-            )
+    # 不填充，直接返回原始长度（后续在循环中按需填充）
+    return obs_list, prev_actions_list, oracle_actions_list, weights_list
 
-        prev_actions_batch[bid] = _pad_helper(
-            prev_actions_batch[bid][:max_traj_len, ...], max_traj_len
-        )
-        corrected_actions_batch[bid] = _pad_helper(
-            corrected_actions_batch[bid][:max_traj_len, ...], max_traj_len
-        )
-        weights_batch[bid] = _pad_helper(weights_batch[bid][:max_traj_len, ...], max_traj_len)
 
-    for sensor in observations_batch:
-        observations_batch[sensor] = torch.stack(
-            observations_batch[sensor], dim=1
-        )
-        observations_batch[sensor] = observations_batch[sensor].view(
-            -1, *observations_batch[sensor].size()[2:]
-        )
 
-    prev_actions_batch = torch.stack(prev_actions_batch, dim=1)
-    corrected_actions_batch = torch.stack(corrected_actions_batch, dim=1)
-    weights_batch = torch.stack(weights_batch, dim=1)
-    not_done_masks = torch.ones_like(
-        corrected_actions_batch, dtype=torch.uint8
-    )
-    not_done_masks[0] = 0
 
-    observations_batch = ObservationsDict(observations_batch)
+    # observations_batch = list(transposed[0])
+    # prev_actions_batch = list(transposed[1])
+    # corrected_actions_batch = list(transposed[2])
+    # weights_batch = list(transposed[3])
+    # B = len(prev_actions_batch)
 
-    return (
-        observations_batch,
-        prev_actions_batch.view(-1, 1),
-        not_done_masks.view(-1, 1),
-        corrected_actions_batch,
-        weights_batch,
-    )
+    # new_observations_batch = defaultdict(list)
+    # for sensor in observations_batch[0]:
+    #     for bid in range(B):
+    #         new_observations_batch[sensor].append(
+    #             observations_batch[bid][sensor]
+    #         )
+
+    # observations_batch = new_observations_batch
+
+    # # max_traj_len = max(ele.size(0) for ele in prev_actions_batch)
+    # max_traj_len = 500
+    # for bid in range(B):
+    #     for sensor in observations_batch:
+    #         fill_val = 0.0 if sensor in ['pixel_values', 'input_ids'] else 1.0
+    #         observations_batch[sensor][bid] = _pad_helper(
+    #             # observations_batch[sensor][bid][:max_traj_len, ...], max_traj_len, fill_val=1.0
+    #             observations_batch[sensor][bid][:max_traj_len, ...], max_traj_len, fill_val=fill_val
+    #         )
+
+    #     prev_actions_batch[bid] = _pad_helper(
+    #         prev_actions_batch[bid][:max_traj_len, ...], max_traj_len
+    #     )
+    #     corrected_actions_batch[bid] = _pad_helper(
+    #         corrected_actions_batch[bid][:max_traj_len, ...], max_traj_len
+    #     )
+    #     weights_batch[bid] = _pad_helper(weights_batch[bid][:max_traj_len, ...], max_traj_len)
+
+    # for sensor in observations_batch:
+    #     observations_batch[sensor] = torch.stack(
+    #         observations_batch[sensor], dim=1
+    #     )
+    #     observations_batch[sensor] = observations_batch[sensor].view(
+    #         -1, *observations_batch[sensor].size()[2:]
+    #     )
+
+    # prev_actions_batch = torch.stack(prev_actions_batch, dim=1)
+    # corrected_actions_batch = torch.stack(corrected_actions_batch, dim=1)
+    # weights_batch = torch.stack(weights_batch, dim=1)
+    # not_done_masks = torch.ones_like(
+    #     corrected_actions_batch, dtype=torch.uint8
+    # )
+    # not_done_masks[0] = 0
+
+    # observations_batch = ObservationsDict(observations_batch)
+
+    # return (
+    #     observations_batch,
+    #     prev_actions_batch.view(-1, 1),
+    #     not_done_masks.view(-1, 1),
+    #     corrected_actions_batch,
+    #     weights_batch,
+    # )
 
 
 def _block_shuffle(lst, block_size):
@@ -533,10 +731,18 @@ def initialize_trainer():
     })
     action_space = spaces.Discrete(int(len(AirsimActions)))
 
+    # 替换 policy 为自定义的 LLaVAPolicy
+    from Model.llava_policy import LLaVAPolicy
+
+    vla_path = "/mnt/sdc/weiguanzhao/navila-llama3-8b-8f"  # 替换为实际路径
+
+    custom_policy = LLaVAPolicy(vla_path, action_space)
+
     trainer = VLNCETrainer(
         load_from_ckpt=False,
         observation_space=observation_space,
         action_space=action_space,
+        policy=custom_policy,
     )
 
     logger.info('initialize_trainer over')
@@ -547,7 +753,7 @@ def collect_data(data_it=0):
     logger.info(args)
 
     # train_env = initialize_env(split='train')
-    train_env = initialize_env(split='scene_3')
+    train_env = initialize_env(split='scene_17')
     trainer = initialize_trainer()
 
     if torch.cuda.is_available():
@@ -977,15 +1183,30 @@ def train_vlnce():
 
     trainer = initialize_trainer()
 
+
+    # 1. 从 trainer 中提取原始模型和优化器
+    # 注意：如果 trainer.policy 已经被 DistributedDataParallel 包装，需要先取出 .module
+    if args.DistributedDataParallel:
+        raw_model = trainer.policy.module if hasattr(trainer.policy, 'module') else trainer.policy
+    else:
+        raw_model = trainer.policy
+
+
+    # 提取处理器（如果 policy 是 LLaVAPolicy）
+    tokenizer = getattr(raw_model, 'tokenizer', None)
+    image_processor = getattr(raw_model, 'image_processor', None)
+
     for dagger_it in range(int(args.dagger_it)):
-        step_id = 0
+        step_id = 0     # 全局步数计数器，可在整个训练过程中累计
 
         if torch.cuda.is_available():
             with torch.cuda.device(trainer.device):
                 torch.cuda.empty_cache()
         gc.collect()
 
-        lmdb_features_dir = str(Path(args.project_prefix) / 'DATA/img_features/collect/{}/train'.format(args.name))
+        # lmdb_features_dir = str(Path(args.project_prefix) / 'DATA/img_features/collect/{}/train'.format(args.name))
+        # 先硬编码调试
+        lmdb_features_dir = '/mnt/sdd/weiguanzhao/AirVLN_ws/DATA/img_features/collect/AerialVLN/scene_17'
         assert os.path.exists(str(lmdb_features_dir))
         use_llama = getattr(args, 'use_llama_tokenizer', False)
         if args.DistributedDataParallel:
@@ -995,6 +1216,8 @@ def train_vlnce():
                 inflection_weight_coef=float(args.inflection_weight_coef),
                 lmdb_map_size=5.0e12,
                 batch_size=args.batchSize,
+                tokenizer=tokenizer,
+                image_processor=image_processor,
             )
             diter = torch.utils.data.DataLoader(
                 dataset,
@@ -1014,6 +1237,10 @@ def train_vlnce():
                 batch_size=args.batchSize,
                 use_llama_tokenizer=use_llama,
                 max_input_len=args.maxInput,
+                use_llava=True,   # 根据实际情况，可设为 args.use_llava
+                # vla_path="/mnt/sdc/weiguanzhao/navila-llama3-8b-8f",
+                tokenizer=tokenizer,
+                image_processor=image_processor,
             )
             diter = torch.utils.data.DataLoader(
                 dataset,
@@ -1034,37 +1261,61 @@ def train_vlnce():
                 leave=False,
                 dynamic_ncols=True,
             ):
-                (
-                    observations_batch,
-                    prev_actions_batch,
-                    not_done_masks,
-                    corrected_actions_batch,
-                    weights_batch,
-                ) = batch
+                # (
+                #     observations_batch,
+                #     prev_actions_batch,
+                #     not_done_masks,
+                #     corrected_actions_batch,
+                #     weights_batch,
+                # ) = batch
 
-                observations_batch = {
-                    k: v.to(
-                        device=trainer.device,
-                        dtype=torch.float32,
-                        non_blocking=True,
-                    )
-                    for k, v in observations_batch.items()
-                }
+                obs_list, prev_actions_list, oracle_actions_list, weights_list = batch
 
+                # observations_batch = {
+                #     k: v.to(
+                #         device=trainer.device,
+                #         dtype=torch.float32,
+                #         non_blocking=True,
+                #     )
+                #     for k, v in observations_batch.items()
+                # }
+
+                # 按传感器类型分别处理：
+                # observations_batch_ = {}
+                # for k, v in observations_batch.items():
+                #     if k == 'input_ids':
+                #         # 保持 long 类型
+                #         observations_batch[k] = v.to(device=trainer.device, dtype=torch.long, non_blocking=True)
+                #     elif k in ['pixel_values', 'rgb', 'depth']:
+                #         # 图像数据用 float32
+                #         observations_batch[k] = v.to(device=trainer.device, dtype=torch.float32, non_blocking=True)
+                #     else:
+                #         # 其他特征（如 progress, pose）根据情况选择
+                #         observations_batch[k] = v.to(device=trainer.device, dtype=torch.float32, non_blocking=True)
+
+
+                # loss, action_loss, aux_loss = trainer._update_agent(
+                #     observations_batch,
+                #     prev_actions_batch.to(
+                #         device=trainer.device, non_blocking=True
+                #     ),
+                #     not_done_masks.to(
+                #         device=trainer.device, non_blocking=True
+                #     ),
+                #     corrected_actions_batch.to(
+                #         device=trainer.device, non_blocking=True
+                #     ),
+                #     weights_batch.to(
+                #         device=trainer.device, non_blocking=True
+                #     ),
+                #     # backward=False,  # 添加一个控制参数，禁止在 _update_agent 内部执行 backward
+                #     # step_grad=False,  # 添加一个控制参数，禁止在 _update_agent 内部执行 step
+                # )
                 loss, action_loss, aux_loss = trainer._update_agent(
-                    observations_batch,
-                    prev_actions_batch.to(
-                        device=trainer.device, non_blocking=True
-                    ),
-                    not_done_masks.to(
-                        device=trainer.device, non_blocking=True
-                    ),
-                    corrected_actions_batch.to(
-                        device=trainer.device, non_blocking=True
-                    ),
-                    weights_batch.to(
-                        device=trainer.device, non_blocking=True
-                    ),
+                    obs_list,
+                    prev_actions_list,
+                    oracle_actions_list,
+                    weights_list,
                 )
 
                 logger.warning(
@@ -1102,8 +1353,16 @@ def train_vlnce():
                 step_id += 1
                 batch_cnt += 1
 
+                # ---- 新增：每 2500 步保存 ----
+                if step_id % 2500 == 0 and is_main_process():
+                    trainer.save_checkpoint(
+                        f"ckpt.step_{step_id}.pth",
+                        dagger_it,
+                        epoch,
+                    )
+
             if is_main_process():
-                if ((dagger_it * args.epochs + epoch)+1) % 5 == 0:
+                if ((dagger_it * args.epochs + epoch)+1) % 2 == 0:
                     trainer.save_checkpoint(
                         f"ckpt.{dagger_it * args.epochs + epoch}.pth",
                         dagger_it,
