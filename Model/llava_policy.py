@@ -85,7 +85,10 @@ class LLaVAPolicy(nn.Module):
         # print(f"model_dtype: {model_dtype}")
         
         input_ids = observations['input_ids']        # [batch, seq_len]
-        
+        # 若没有 attention_mask，根据 pad_token_id=0 生成
+        attention_mask = observations.get('attention_mask')
+        if attention_mask is None:
+            attention_mask = (input_ids != 0).long()
 
         # 如果有历史图像特征，也转换
         history_values = observations.get('history_values', None)
@@ -98,13 +101,14 @@ class LLaVAPolicy(nn.Module):
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 history_values=history_values,
-                attention_mask=observations.get('attention_mask'),
+                attention_mask=attention_mask,
                 use_cache=False,
                 output_hidden_states=True,
                 return_dict=True
             )
-        # 取最后一个 token 的隐藏状态（通常是动作预测位置）
-        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [batch, hidden]
+        # 取每个样本最后一个非 pad token 的隐藏状态
+        last_non_pad_idx = attention_mask.sum(dim=1) - 1  # (B,)
+        last_hidden = outputs.hidden_states[-1][torch.arange(input_ids.size(0)), last_non_pad_idx, :]
         last_hidden = last_hidden.float()   # 转换为 float32 以匹配线性层权重
         action_logits = self.action_head(last_hidden)     # [batch, action_dim]
 

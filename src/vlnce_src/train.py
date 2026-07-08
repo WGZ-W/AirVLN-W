@@ -207,12 +207,13 @@ class DDPIWTrajectoryDataset(torch.utils.data.IterableDataset):
         prev_actions = torch.from_numpy(np.copy(prev_actions))
         oracle_actions = torch.from_numpy(np.copy(oracle_actions))
 
-        inflections = torch.cat(
-            [
+        if oracle_actions.numel() == 1:
+            inflections = torch.tensor([1], dtype=torch.long)
+        else:
+            inflections = torch.cat([
                 torch.tensor([1], dtype=torch.long),
-                (oracle_actions[1:] != oracle_actions[:-1]).long(),
-            ]
-        )
+                (oracle_actions[1:] != oracle_actions[:-1]).long()
+            ])
 
         return (
             obs,
@@ -423,12 +424,13 @@ class IWTrajectoryDataset(torch.utils.data.IterableDataset):
         prev_actions = torch.from_numpy(np.copy(prev_actions))
         oracle_actions = torch.from_numpy(np.copy(oracle_actions))
 
-        inflections = torch.cat(
-            [
+        if oracle_actions.numel() == 1:
+            inflections = torch.tensor([1], dtype=torch.long)
+        else:
+            inflections = torch.cat([
                 torch.tensor([1], dtype=torch.long),
-                (oracle_actions[1:] != oracle_actions[:-1]).long(),
-            ]
-        )
+                (oracle_actions[1:] != oracle_actions[:-1]).long()
+            ])
 
         return (
             obs,
@@ -465,6 +467,19 @@ class ObservationsDict(dict):
             self[k] = v.pin_memory()
 
         return self
+    
+
+
+def collate_fn(batch):
+    """直接返回四个列表，每个列表包含 batch_size 个样本的序列数据"""
+    obs_list = [item[0] for item in batch]
+    prev_actions_list = [item[1] for item in batch]
+    oracle_actions_list = [item[2] for item in batch]
+    weights_list = [item[3] for item in batch]
+    return obs_list, prev_actions_list, oracle_actions_list, weights_list
+
+
+
 
 # def collate_fn(batch):
 #     """Each sample in batch: (
@@ -525,68 +540,68 @@ class ObservationsDict(dict):
 
 
 
-def collate_fn(batch):
-    """Each sample in batch: (
-        obs,
-        prev_actions,
-        oracle_actions,
-        inflec_weight,
-    )
-    """
+# def collate_fn(batch):
+#     """Each sample in batch: (
+#         obs,
+#         prev_actions,
+#         oracle_actions,
+#         inflec_weight,
+#     )
+#     """
 
-    def _pad_helper(t, max_len, fill_val=0):
-        pad_amount = max_len - t.size(0)
-        if pad_amount == 0:
-            return t
+#     def _pad_helper(t, max_len, fill_val=0):
+#         pad_amount = max_len - t.size(0)
+#         if pad_amount == 0:
+#             return t
 
-        pad = torch.full_like(t[0:1], fill_val).expand(
-            pad_amount, *t.size()[1:]
-        )
-        return torch.cat([t, pad], dim=0)
+#         pad = torch.full_like(t[0:1], fill_val).expand(
+#             pad_amount, *t.size()[1:]
+#         )
+#         return torch.cat([t, pad], dim=0)
 
-    transposed = list(zip(*batch))
-    obs_list = transposed[0]          # list of dict, 每个dict对应一个轨迹
-    prev_actions_list = transposed[1] # list of Tensor, 每个形状 (T_i,)
-    oracle_actions_list = transposed[2]
-    weights_list = transposed[3]
+#     transposed = list(zip(*batch))
+#     obs_list = transposed[0]          # list of dict, 每个dict对应一个轨迹
+#     prev_actions_list = transposed[1] # list of Tensor, 每个形状 (T_i,)
+#     oracle_actions_list = transposed[2]
+#     weights_list = transposed[3]
 
-    # 计算 batch 内最大轨迹长度
-    max_len = max([obs['pixel_values'].shape[0] for obs in obs_list])
+#     # 计算 batch 内最大轨迹长度
+#     max_len = max([obs['pixel_values'].shape[0] for obs in obs_list])
 
-    # 填充函数
-    def pad_obs(obs, max_len):
-        new_obs = {}
-        for k, v in obs.items():
-            if isinstance(v, torch.Tensor):
-                # 根据传感器类型选择填充值（图像/特征用0，指令用0）
-                pad_val = 0 if k in ['pixel_values', 'input_ids'] else 1
-                # 填充到 max_len
-                pad_size = max_len - v.shape[0]
-                if pad_size > 0:
-                    pad = torch.full((pad_size, *v.shape[1:]), pad_val, dtype=v.dtype)
-                    v = torch.cat([v, pad], dim=0)
-                new_obs[k] = v
-            else:
-                new_obs[k] = v
-        return new_obs
+#     # 填充函数
+#     def pad_obs(obs, max_len):
+#         new_obs = {}
+#         for k, v in obs.items():
+#             if isinstance(v, torch.Tensor):
+#                 # 根据传感器类型选择填充值（图像/特征用0，指令用0）
+#                 pad_val = 0 if k in ['pixel_values', 'input_ids'] else 1
+#                 # 填充到 max_len
+#                 pad_size = max_len - v.shape[0]
+#                 if pad_size > 0:
+#                     pad = torch.full((pad_size, *v.shape[1:]), pad_val, dtype=v.dtype)
+#                     v = torch.cat([v, pad], dim=0)
+#                 new_obs[k] = v
+#             else:
+#                 new_obs[k] = v
+#         return new_obs
 
-    # 对每个轨迹填充
-    obs_list = [pad_obs(obs, max_len) for obs in obs_list]
-    prev_actions_list = [
-        torch.cat([act, torch.full((max_len - act.shape[0],), 0, dtype=act.dtype)]) 
-        if act.shape[0] < max_len else act for act in prev_actions_list
-    ]
-    oracle_actions_list = [
-        torch.cat([act, torch.full((max_len - act.shape[0],), 0, dtype=act.dtype)]) 
-        if act.shape[0] < max_len else act for act in oracle_actions_list
-    ]
-    weights_list = [
-        torch.cat([w, torch.full((max_len - w.shape[0],), 0.0, dtype=w.dtype)]) 
-        if w.shape[0] < max_len else w for w in weights_list
-    ]
+#     # 对每个轨迹填充
+#     obs_list = [pad_obs(obs, max_len) for obs in obs_list]
+#     prev_actions_list = [
+#         torch.cat([act, torch.full((max_len - act.shape[0],), 0, dtype=act.dtype)]) 
+#         if act.shape[0] < max_len else act for act in prev_actions_list
+#     ]
+#     oracle_actions_list = [
+#         torch.cat([act, torch.full((max_len - act.shape[0],), 0, dtype=act.dtype)]) 
+#         if act.shape[0] < max_len else act for act in oracle_actions_list
+#     ]
+#     weights_list = [
+#         torch.cat([w, torch.full((max_len - w.shape[0],), 0.0, dtype=w.dtype)]) 
+#         if w.shape[0] < max_len else w for w in weights_list
+#     ]
 
-    # 不填充，直接返回原始长度（后续在循环中按需填充）
-    return obs_list, prev_actions_list, oracle_actions_list, weights_list
+#     # 不填充，直接返回原始长度（后续在循环中按需填充）
+#     return obs_list, prev_actions_list, oracle_actions_list, weights_list
 
 
 
@@ -1195,6 +1210,8 @@ def train_vlnce():
     # 提取处理器（如果 policy 是 LLaVAPolicy）
     tokenizer = getattr(raw_model, 'tokenizer', None)
     image_processor = getattr(raw_model, 'image_processor', None)
+    if tokenizer is None or image_processor is None:
+        raise ValueError("Tokenizer or image_processor not found in policy. Ensure LLaVAPolicy initializes them.")
 
     for dagger_it in range(int(args.dagger_it)):
         step_id = 0     # 全局步数计数器，可在整个训练过程中累计
@@ -1206,7 +1223,7 @@ def train_vlnce():
 
         # lmdb_features_dir = str(Path(args.project_prefix) / 'DATA/img_features/collect/{}/train'.format(args.name))
         # 先硬编码调试
-        lmdb_features_dir = '/mnt/sdd/weiguanzhao/AirVLN_ws/DATA/img_features/collect/AerialVLN/scene_17'
+        lmdb_features_dir = '/mnt/sdd/weiguanzhao/AirVLN_ws/DATA/img_features/collect/AerialVLN/train'
         assert os.path.exists(str(lmdb_features_dir))
         use_llama = getattr(args, 'use_llama_tokenizer', False)
         if args.DistributedDataParallel:
@@ -1227,6 +1244,9 @@ def train_vlnce():
                 pin_memory=False,
                 drop_last=True,
                 num_workers=0,
+                # num_workers=4,          # 改为 4~8，利用 CPU 多核预加载
+                # prefetch_factor=4,      # 提前预取 4 个 batch
+                # persistent_workers=True # 保持进程存活，避免反复创建开销
             )
         else:
             dataset = IWTrajectoryDataset(
@@ -1354,7 +1374,7 @@ def train_vlnce():
                 batch_cnt += 1
 
                 # ---- 新增：每 2500 步保存 ----
-                if step_id % 2500 == 0 and is_main_process():
+                if step_id % 100 == 0 and is_main_process():
                     trainer.save_checkpoint(
                         f"ckpt.step_{step_id}.pth",
                         dagger_it,

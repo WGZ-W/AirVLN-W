@@ -154,12 +154,14 @@ class VLNCETrainer:
         weights_list,
     ):
         device = self.device
-        model_dtype = next(self.policy.parameters()).dtype
+        model = self.policy.module if hasattr(self.policy, 'module') else self.policy
+        model_dtype = next(model.parameters()).dtype
+
         N = len(obs_list)
         if N == 0:
             return 0.0, 0.0, 0.0
 
-        # 各轨迹的真实长度（假设 rgb 是传感器之一，也可用任意键）
+        # 各轨迹有效长度（假设都有 'pixel_values'）
         lengths = [obs['pixel_values'].shape[0] for obs in obs_list]
         T_max = max(lengths) if lengths else 0
         if T_max == 0:
@@ -169,113 +171,82 @@ class VLNCETrainer:
         total_action_loss = 0.0
         total_aux_loss = 0.0
 
-        # LLaVAPolicy 无需 RNN 状态
-        rnn_states = None
-
-        # 清空辅助损失（全局单例）
         AuxLosses.clear()
-
-        # use_deepspeed = hasattr(self, 'deepspeed_engine') and self.deepspeed_engine is not None
-        # 判断是否使用 DDP（有 no_sync 属性）
-        use_ddp = hasattr(self.policy, 'no_sync') and not hasattr(self, 'deepspeed_engine')
+        use_ddp = hasattr(self.policy, 'no_sync')
 
         for t in range(T_max):
-            # 收集当前时间步有效的轨迹索引（长度 > t）
             valid_indices = [i for i, l in enumerate(lengths) if l > t]
             if not valid_indices:
                 continue
 
-            # ---- 构建当前时间步的观测字典 ----
+            # 构建当前时间步的观测
             obs_t = {}
-            # 取第一个有效轨迹的传感器键
-            sample_obs = obs_list[valid_indices[0]]
-            for key in sample_obs.keys():
-                # 收集所有有效轨迹的第 t 个时间步数据
+            sample_key = next(iter(obs_list[valid_indices[0]]))
+            for key in sample_key:
                 tensors = [obs_list[i][key][t] for i in valid_indices]
-                # 根据数据类型移动至 GPU 并转换 dtype
                 if torch.is_floating_point(tensors[0]):
                     tensors = [v.to(device=device, dtype=model_dtype) for v in tensors]
                 else:
                     tensors = [v.to(device=device) for v in tensors]
                 obs_t[key] = torch.stack(tensors, dim=0)   # (valid_N, ...)
 
-            # ---- 处理动作和权重 ----
+            # 处理动作和权重
             prev_actions_t = torch.stack(
                 [prev_actions_list[i][t].to(device) for i in valid_indices], dim=0
             ).unsqueeze(1)  # (valid_N, 1)
-
             oracle_actions_t = torch.stack(
                 [oracle_actions_list[i][t].to(device) for i in valid_indices], dim=0
             )  # (valid_N,)
-
             weights_t = torch.stack(
                 [weights_list[i][t].to(device) for i in valid_indices], dim=0
             )  # (valid_N,)
 
-            # ---- 前向传播，得到分布 ----
-            # masks 参数传 None（LLaVAPolicy 不使用）
-            # distribution = self.policy.build_distribution(
-            # DDP
-            distribution = self.policy.module.build_distribution(
-                obs_t, rnn_states, prev_actions_t, None
-            )
-            logits = distribution.logits  # (valid_N, num_actions)
-
-            # ---- 计算动作损失（加权平均） ----
-            action_loss_t = F.cross_entropy(logits, oracle_actions_t, reduction='none')
-            loss_t = (weights_t * action_loss_t).sum() / (weights_t.sum() + 1e-8)
-            loss_t = loss_t / T_max   # 平均到每个时间步，保持梯度尺度
-            # print(f"Step:{t} Loss: {loss_t}")
-            # 替换为：
-            if dist.is_initialized():
-                rank = dist.get_rank()
-            else:
-                rank = 0
-            if t % 10 == 0:  # 每10步打印一次，避免刷屏
-                print(f"[Rank {rank}] Step:{t}/{T_max-1} Loss: {loss_t.item():.6f}")
-            
-
-            # ---- 辅助损失（如果有） ----
-            aux_mask = (weights_t > 0).view(-1)
-            aux_loss_t = AuxLosses.reduce(aux_mask)   # 返回并清空
-            if aux_loss_t != 0.0:
-                aux_loss_t = aux_loss_t / T_max
-                loss_t = loss_t + aux_loss_t
-
-            # ---- 反向传播（立即释放计算图） ----
-            # loss_t.backward()
-            # ---- 反向传播：使用 no_sync 抑制通信 ----
+            # 构建分布（使用正确的模型对象）
             if use_ddp:
-                # 只在最后一个时间步同步，之前抑制通信
+                distribution = self.policy.module.build_distribution(
+                    obs_t, None, prev_actions_t, None
+                )
+            else:
+                distribution = self.policy.build_distribution(
+                    obs_t, None, prev_actions_t, None
+                )
+
+            logits = distribution.logits
+            action_loss_t = F.cross_entropy(logits, oracle_actions_t, reduction='none')
+            # 加权平均
+            loss_t = (weights_t * action_loss_t).sum() / (weights_t.sum() + 1e-8)
+            loss_t = loss_t / T_max   # 缩放梯度，使得总损失与时间步长无关
+
+            # 反向传播（DDP 时最后一步同步）
+            if use_ddp:
                 if t < T_max - 1:
                     with self.policy.no_sync():
                         loss_t.backward()
                 else:
-                    loss_t.backward()  # 最后一次同步所有梯度
+                    loss_t.backward()
             else:
-                # DeepSpeed 或单卡，直接 backward
                 loss_t.backward()
-            
 
-            # 累加用于日志的损失值（还原为未平均的数值）
+            # 累加日志损失（还原未缩放的值）
             total_loss += loss_t.item() * T_max
             total_action_loss += action_loss_t.mean().item() * T_max
-            total_aux_loss += (aux_loss_t.item() if isinstance(aux_loss_t, torch.Tensor) else aux_loss_t) * T_max
 
-        # ---- 梯度裁剪（可选） ----
-        
+            # 辅助损失（全局 AuxLosses 会在每次 reduce 时清空）
+            aux_mask = (weights_t > 0).view(-1)
+            aux_loss_t = AuxLosses.reduce(aux_mask)
+            if aux_loss_t != 0.0:
+                if isinstance(aux_loss_t, torch.Tensor):
+                    aux_loss_t = aux_loss_t.item()
+                total_aux_loss += aux_loss_t * T_max
+
+        # 梯度裁剪与参数更新
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
-
-        # ---- 更新参数 ----
-        # ---- 更新参数 ----
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        # 返回平均损失
         avg_loss = total_loss / T_max
         avg_action_loss = total_action_loss / T_max
         avg_aux_loss = total_aux_loss / T_max
-        print(f"Average Loss: {avg_loss}")
         return avg_loss, avg_action_loss, avg_aux_loss
 
 
