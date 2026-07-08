@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import datetime
 
 from src.common.param import args
 
@@ -49,6 +50,7 @@ def init_distributed_mode():
         init_method='env://',
         world_size=world_size,
         rank=rank,
+        timeout=datetime.timedelta(seconds=3600),  # 增加这一行
     )
     torch.distributed.barrier()
 
@@ -72,6 +74,7 @@ def manual_init_distributed_mode(rank, world_size, local_rank):
         init_method='env://',
         world_size=world_size,
         rank=rank,
+        timeout=datetime.timedelta(seconds=3600),  # 增加这一行
     )
     torch.distributed.barrier()
 
